@@ -1,39 +1,44 @@
 package jenkins.plugins.fogbugz.notifications;
 
-import com.github.jknack.handlebars.Handlebars;
-import com.github.jknack.handlebars.Template;
-import com.github.jknack.handlebars.Context;
-
 import hudson.EnvVars;
-import hudson.tasks.test.AbstractTestResultAction;
-import jenkins.plugins.fogbugz.FogbugzProjectProperty;
-import lombok.Setter;
-import org.apache.commons.lang.StringEscapeUtils;
-
 import hudson.Extension;
 import hudson.Launcher;
-import hudson.model.*;
-import hudson.tasks.*;
+import hudson.model.BuildListener;
+import hudson.model.Result;
+import hudson.model.AbstractBuild;
+import hudson.model.AbstractProject;
+import hudson.model.Project;
+import hudson.tasks.BuildStepDescriptor;
+import hudson.tasks.BuildStepMonitor;
+import hudson.tasks.Notifier;
+import hudson.tasks.Publisher;
 import hudson.tasks.test.AbstractTestResultAction;
-import lombok.Getter;
-import lombok.extern.java.Log;
-import net.sf.json.JSONObject;
-import org.kohsuke.stapler.DataBoundConstructor;
-import org.kohsuke.stapler.StaplerRequest;
-import org.paylogic.fogbugz.FogbugzCase;
-import org.paylogic.fogbugz.FogbugzManager;
-import org.paylogic.fogbugz.FogbugzEvent;
-import org.paylogic.fogbugz.InvalidResponseException;
 
 import java.io.IOException;
 import java.io.PrintStream;
-import java.util.HashMap;
-import java.util.Map;
 import java.util.logging.Level;
+
+import jenkins.plugins.fogbugz.FogbugzProjectProperty;
+import lombok.Getter;
+import lombok.extern.java.Log;
+import net.sf.json.JSONObject;
+
+import org.apache.commons.lang.StringEscapeUtils;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.StaplerRequest;
+import org.paylogic.fogbugz.FogbugzCase;
+import org.paylogic.fogbugz.FogbugzEvent;
+import org.paylogic.fogbugz.FogbugzManager;
+
+import com.github.jknack.handlebars.Context;
+import com.github.jknack.handlebars.Handlebars;
+import com.github.jknack.handlebars.Template;
+import com.google.common.base.Splitter;
 
 /**
  * Notifier in Jenkins system, reports status to Fogbugz.
- * Gets its information from a build parameter called "CASE_ID", so make sure you set that.
+ * Gets its information from a build parameter called "CASE_ID", so make sure
+ * you set that.
  */
 @Log
 public class FogbugzNotifier extends Notifier {
@@ -47,14 +52,14 @@ public class FogbugzNotifier extends Notifier {
         return "Fogbugz notification settings";
     }
 
-	public BuildStepMonitor getRequiredMonitorService() {
+    public BuildStepMonitor getRequiredMonitorService() {
         return BuildStepMonitor.NONE;
-	}
+    }
 
-	@Override
-	public boolean needsToRunAfterFinalized() {
+    @Override
+    public boolean needsToRunAfterFinalized() {
         return true;
-	}
+    }
 
     private String stringOrEmpty(int param) {
         return param == 0 ? Integer.toString(param) : "";
@@ -71,50 +76,63 @@ public class FogbugzNotifier extends Notifier {
         EnvVars envVars = null;
         try {
             envVars = build.getEnvironment(listener);
-        } catch (Exception e) {
+        }
+        catch (Exception e) {
             log.log(Level.SEVERE, "Exception while fetching environment variables.", e);
         }
 
-        String givenCaseId = envVars.get("CASE_ID", "");
+        String givenCaseIds = envVars.get("CASE_ID", "");
 
         /* Get the name of the branch so we can figure out which case this build belongs to */
-        if (!givenCaseId.isEmpty() && !givenCaseId.equals("0")) {
+        if (!givenCaseIds.isEmpty() && !givenCaseIds.equals("0")) {
             log.info("Using given case ID for reporting.");
-        } else {
+        }
+        else {
             log.info("No case branch found, currently not reporting to fogbugz.");
-            return false;  // TODO: should we return true or false here?
-                           // TODO: and does that even impact build status since this is a Notifier?
+            return true;
         }
 
-        int usableCaseId = 0;
-        if (!givenCaseId.isEmpty()) {
-            usableCaseId = Integer.parseInt(givenCaseId);
-        }
+        String reportingExtraMessage = getReportingExtraMessage(build);
 
+        Iterable<String> caseIds = Splitter.on(',').trimResults().omitEmptyStrings().split(givenCaseIds);
+        for (String id : caseIds) {
+            notifyCase(build, listener, id, reportingExtraMessage);
+        }
+        return true;
+    }
+
+    private String getReportingExtraMessage(AbstractBuild build) {
         /* Parse log file and build message string with its result. */
         LogMessageSearcher messageSearcher = new LogMessageSearcher(build);
         String reportingExtraMessage = "";
         try {
-            for (String line: messageSearcher.searchForMessages()) {
+            for (String line : messageSearcher.searchForMessages()) {
                 reportingExtraMessage += line.replace(LogMessageSearcher.getMessagePrefix(), "") + "\n"; // Remove prefix
             }
-        } catch (IOException e) {
+        }
+        catch (IOException e) {
             reportingExtraMessage = "Failure while retrieving messages from logfile.";
             log.log(Level.SEVERE, "Failure while retrieving messages from logfile.", e);
         }
 
         if (build.getResult() != Result.SUCCESS) {
-            reportingExtraMessage += "\nGatekeepering and Upmerging have been aborted, " +
-                    "and no further actions were performed, because the build failed.";
+            reportingExtraMessage += "\nGatekeepering and Upmerging have been aborted, " + "and no further actions were performed, because the build failed.";
         }
+        return reportingExtraMessage;
+    }
 
-
+    private boolean notifyCase(AbstractBuild build, BuildListener listener, String caseId, String reportingExtraMessage) {
         /* Retrieve case */
         FogbugzManager caseManager = this.getFogbugzManager();
         FogbugzCase fbCase = null;
         try {
+            int usableCaseId = 0;
+            if (!caseId.isEmpty()) {
+                usableCaseId = Integer.parseInt(caseId);
+            }
             fbCase = caseManager.getCaseById(usableCaseId);
-        } catch (Exception e) {
+        }
+        catch (Exception e) {
             log.log(Level.SEVERE, "Fetching case from fogbugz failed. Please check your settings.", e);
             listener.getLogger().append("Fetching case from Fogbugz failed. Please check your settings.");
             return false;
@@ -123,7 +141,6 @@ public class FogbugzNotifier extends Notifier {
             log.log(Level.SEVERE, "Fetching case from fogbugz failed. Please check your settings.");
             return false;
         }
-
         FogbugzEvent lastAssignmentEvent = caseManager.getLastAssignedToGatekeepersEvent(fbCase.getId());
 
         /* Fill template context with useful variables. */
@@ -132,8 +149,7 @@ public class FogbugzNotifier extends Notifier {
         templateContext.data("buildNumber", Integer.toString(build.getNumber()));
         templateContext.data("buildResult", build.getResult().toString());
         log.log(Level.FINE, "ReportingExtraMessage: " + reportingExtraMessage);
-        templateContext.data(
-                "messages", StringEscapeUtils.unescapeXml(StringEscapeUtils.unescapeHtml(reportingExtraMessage)));
+        templateContext.data("messages", StringEscapeUtils.unescapeXml(StringEscapeUtils.unescapeHtml(reportingExtraMessage)));
         try {
             AbstractTestResultAction testResultAction = build.getAction(AbstractTestResultAction.class);
             if (testResultAction != null) {
@@ -141,7 +157,8 @@ public class FogbugzNotifier extends Notifier {
                 templateContext.data("tests_skipped", testResultAction.getSkipCount());
                 templateContext.data("tests_total", testResultAction.getTotalCount());
             }
-        } catch (Exception e) {
+        }
+        catch (Exception e) {
             log.log(Level.SEVERE, "Exception during fetching of test results:", e);
             templateContext.data("tests_failed", "");
             templateContext.data("tests_skipped", "");
@@ -152,7 +169,8 @@ public class FogbugzNotifier extends Notifier {
         if (this.getDescriptor().doAssignBaseCase()) {
             try {
                 fbCase.setAssignedTo(lastAssignmentEvent.getPerson());
-            } catch (Exception e) {
+            }
+            catch (Exception e) {
                 fbCase.setAssignedTo(this.getDescriptor().getGatekeeperUserId());
             }
         }
@@ -181,7 +199,8 @@ public class FogbugzNotifier extends Notifier {
                 caseManager.createMilestoneIfNotExists(milestoneName);
                 fbCase.setMilestone(milestoneName);
             }
-        } else {
+        }
+        else {
             try {
                 mustacheTemplate = handlebars.compileInline(this.getDescriptor().getFailedBuildTemplate());
             }
@@ -195,9 +214,10 @@ public class FogbugzNotifier extends Notifier {
             try {
                 message = mustacheTemplate.apply(templateContext);
             }
-            catch (IOException e) {
-            }
+            catch (IOException e) {}
         }
+        PrintStream l = listener.getLogger();
+        l.println("-------> updating case " + fbCase.getId());
         caseManager.saveCase(fbCase, message);
 
         return true;
@@ -221,20 +241,19 @@ public class FogbugzNotifier extends Notifier {
             try {
                 message = mustacheTemplate.apply(templateContext);
             }
-            catch (IOException e) {
-            }
+            catch (IOException e) {}
         }
         this.getFogbugzManager().saveCase(fbCase, message);
     }
 
+    @Override
     public DescriptorImpl getDescriptor() {
-        return (DescriptorImpl)super.getDescriptor();
+        return (DescriptorImpl) super.getDescriptor();
     }
 
     public FogbugzManager getFogbugzManager() {
         return this.getDescriptor().getFogbugzManager();
     }
-
 
     /**
      * Global settings for FogbugzPlugin.
@@ -242,24 +261,33 @@ public class FogbugzNotifier extends Notifier {
      */
     @Extension
     public static class DescriptorImpl extends BuildStepDescriptor<Publisher> {
-        @Getter private String token;
+        @Getter
+        private String  token;
 
-        private String failedBuildTemplate;
-        private String successfulBuildTemplate;
-        private String scheduledBuildTemplate;
+        private String  failedBuildTemplate;
+        private String  successfulBuildTemplate;
+        private String  scheduledBuildTemplate;
 
-        @Getter private String featureBranchFieldname;
-        @Getter private String originalBranchFieldname;
-        @Getter private String targetBranchFieldname;
-        @Getter private String approvedRevisionFieldname;
-        @Getter private String ciProjectFieldName;
+        @Getter
+        private String  featureBranchFieldname;
+        @Getter
+        private String  originalBranchFieldname;
+        @Getter
+        private String  targetBranchFieldname;
+        @Getter
+        private String  approvedRevisionFieldname;
+        @Getter
+        private String  ciProjectFieldName;
 
-        private int mergekeeperUserId;
-        private int gatekeeperUserId;
+        private int     mergekeeperUserId;
+        private int     gatekeeperUserId;
 
-        @Getter private boolean assignBackCase = true;
-        @Getter private boolean setMilestone = true;
-        @Getter private String successfulBuildTag = "";
+        @Getter
+        private boolean assignBackCase     = true;
+        @Getter
+        private boolean setMilestone       = true;
+        @Getter
+        private String  successfulBuildTag = "";
 
         public String getUrl() {
             return new FogbugzProjectProperty().getDescriptor().getUrl();
@@ -276,7 +304,8 @@ public class FogbugzNotifier extends Notifier {
         public int getMergekeeperUserId() {
             if (this.mergekeeperUserId == 0) {
                 return 1;
-            } else {
+            }
+            else {
                 return this.mergekeeperUserId;
             }
         }
@@ -284,37 +313,37 @@ public class FogbugzNotifier extends Notifier {
         public int getGatekeeperUserId() {
             if (this.gatekeeperUserId == 0) {
                 return 1;
-            } else {
+            }
+            else {
                 return this.gatekeeperUserId;
             }
         }
 
         public String getFailedBuildTemplate() {
             if (this.failedBuildTemplate == null || this.failedBuildTemplate.isEmpty()) {
-                return "Jenkins reports that the build has {{tests_failed}} failed tests :(" +
-                        "\nCatched log messages:\n{{messages}}" +
-                        "\nView extended result here: {{url}}";
-            } else {
+                return "Jenkins reports that the build has {{tests_failed}} failed tests :(" + "\nCatched log messages:\n{{messages}}"
+                       + "\nView extended result here: {{url}}";
+            }
+            else {
                 return this.failedBuildTemplate;
             }
         }
 
         public String getSuccessfulBuildTemplate() {
             if (this.successfulBuildTemplate == null || this.successfulBuildTemplate.isEmpty()) {
-                return "Jenkins reports that the build was successful!" +
-                        "\nCatched log messages:\n{{messages}}" +
-                        "\nView extended result here: {{url}}";
-            } else {
+                return "Jenkins reports that the build was successful!" + "\nCatched log messages:\n{{messages}}"
+                       + "\nView extended result here: {{url}}";
+            }
+            else {
                 return this.successfulBuildTemplate;
             }
         }
 
-
         public String getScheduledBuildTemplate() {
             if (this.scheduledBuildTemplate == null || this.scheduledBuildTemplate.isEmpty()) {
-                return "Scheduled a jenkins build on a {{name}} job. Stay tuned!" +
-                        "\nView the job here: {{url}}";
-            } else {
+                return "Scheduled a jenkins build on a {{name}} job. Stay tuned!" + "\nView the job here: {{url}}";
+            }
+            else {
                 return this.scheduledBuildTemplate;
             }
         }
@@ -324,18 +353,19 @@ public class FogbugzNotifier extends Notifier {
             load();
         }
 
-		@Override
-		public boolean isApplicable(Class<? extends AbstractProject> type) {
+        @Override
+        public boolean isApplicable(Class<? extends AbstractProject> type) {
             return true;
-		}
-
-		@Override
-		public String getDisplayName() {
-            return "Report status to related FogBugz case.";
-		}
+        }
 
         @Override
-        public boolean configure(StaplerRequest req, JSONObject formData) throws FormException {
+        public String getDisplayName() {
+            return "Report status to related FogBugz case.";
+        }
+
+        @Override
+        public boolean configure(StaplerRequest req, JSONObject formData)
+                                                                         throws FormException {
             this.token = formData.getString("token");
             this.featureBranchFieldname = formData.getString("featureBranchFieldname");
             this.originalBranchFieldname = formData.getString("originalBranchFieldname");
@@ -368,11 +398,16 @@ public class FogbugzNotifier extends Notifier {
         }
 
         public FogbugzManager getFogbugzManager() {
-            return new FogbugzManager(this.getUrl(), this.getToken(), this.getFeatureBranchFieldname(),
-                    this.getOriginalBranchFieldname(), this.getTargetBranchFieldname(), this.getApprovedRevisionFieldname(),
+            return new FogbugzManager(this.getUrl(),
+                    this.getToken(),
+                    this.getFeatureBranchFieldname(),
+                    this.getOriginalBranchFieldname(),
+                    this.getTargetBranchFieldname(),
+                    this.getApprovedRevisionFieldname(),
                     this.getCiProjectFieldName(),
-                    this.getMergekeeperUserId(), this.getGatekeeperUserId());
+                    this.getMergekeeperUserId(),
+                    this.getGatekeeperUserId());
         }
 
-	}
+    }
 }
